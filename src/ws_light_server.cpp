@@ -1,27 +1,27 @@
 /**
  * @file ws_light_server.cpp
  * @brief WSLightServer server class implementation.
- * 
+ *
  * This file defines the WSLightServer class implementation.
- * 
+ *
  * @author Daniel Giménez
  * @date 2024-08-05
  * @license MIT License
- * 
+ *
  * @par License:
- * 
+ *
  * MIT License
- * 
+ *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
  * in the Software without restriction, including without limitation the rights
  * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
  * copies of the Software, and to permit persons to whom the Software is
  * furnished to do so, subject to the following conditions:
- * 
+ *
  * The above copyright notice and this permission notice shall be included in
  * all copies or substantial portions of the Software.
- * 
+ *
  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
  * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
@@ -30,7 +30,6 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
  * THE SOFTWARE.
  */
-
 
 #include "ws_light_server.h"
 #include <cstring>
@@ -146,8 +145,11 @@ esp_err_t WSLightServer::wifi_init(const char *ssid, const char *password, std::
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
     wifi_config_t ap_config = {};
-    strncpy((char *)ap_config.ap.ssid, ssid, sizeof(ap_config.ap.ssid));
-    strncpy((char *)ap_config.ap.password, password, sizeof(ap_config.ap.password));
+    strncpy((char *)ap_config.ap.ssid, ssid, sizeof(ap_config.ap.ssid) - 1);
+    ap_config.ap.ssid[sizeof(ap_config.ap.ssid) - 1] = '\0';
+
+    strncpy((char *)ap_config.ap.password, password, sizeof(ap_config.ap.password) - 1);
+    ap_config.ap.password[sizeof(ap_config.ap.password) - 1] = '\0';
     ap_config.ap.max_connection = 1;
     ap_config.ap.authmode = WIFI_AUTH_WPA_WPA2_PSK;
 
@@ -382,7 +384,7 @@ void WSLightServer::handle_client()
                     }
                     else
                     {
-                        ESP_LOGI("WSLightServer", "Received text message: %s",(std::string((char *)decoded.data, decoded.length).c_str()));
+                        ESP_LOGI("WSLightServer", "Received text message: %s", (std::string((char *)decoded.data, decoded.length).c_str()));
                     }
                     break;
                 case HTTPD_WS_TYPE_BINARY:
