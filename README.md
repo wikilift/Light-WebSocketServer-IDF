@@ -40,7 +40,7 @@ For a multi-client implementation with ssl please visit my other repository
     ```sh
     idf.py menuconfig
     Enable WebSocket support: Component config -> ESP HTTP server -> Enable ESP_HTTPS_SERVER component.
-    Increase timer stack size: Component config -> FreeRTOS -> Kernel -> Timer task stack size to 4096.
+    Increase timer stack size: Component config -> FreeRTOS -> Kernel -> TIMER_TASK_STACK_DEPTH to 4096.
     ```
     
 
