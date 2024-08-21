@@ -1,29 +1,29 @@
 /**
  * @file ws_light_server.h
  * @brief WSLightServer server class for handling WebSocket connection and messages.
- * 
- * This file defines the WSLightServer class, which provides a WebSocket server implementation
+ *
+ * This file  provides a WebSocket server implementation
  * for the ESP32 using the ESP-IDF framework. It includes functionality for handling text
  * and binary messages, managing client connections, and performing keep-alive checks.
- * 
+ *
  * @author Daniel Giménez
  * @date 2024-08-05
  * @license MIT License
- * 
+ *
  * @par License:
- * 
+ *
  * MIT License
- * 
+ *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
  * in the Software without restriction, including without limitation the rights
  * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
  * copies of the Software, and to permit persons to whom the Software is
  * furnished to do so, subject to the following conditions:
- * 
+ *
  * The above copyright notice and this permission notice shall be included in
  * all copies or substantial portions of the Software.
- * 
+ *
  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
  * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
@@ -53,11 +53,11 @@
  */
 struct ws_message_t
 {
-    int client_sock;                 /**< Socket of the client */
-    uint8_t data[MAX_MESSAGE_SIZE];  /**< Data of the message */
-    size_t length;                   /**< Length of the message */
-    ws_type_t type;                  /**< Type of the message */
-    bool broadcast;                  /**< Broadcast flag */
+    int client_sock;                /**< Socket of the client */
+    uint8_t data[MAX_MESSAGE_SIZE]; /**< Data of the message */
+    size_t length;                  /**< Length of the message */
+    ws_type_t type;                 /**< Type of the message */
+    bool broadcast;                 /**< Broadcast flag */
 };
 
 /**
@@ -90,7 +90,9 @@ public:
                     uint64_t ping_interval_ms = 30000,
                     uint64_t max_inactivity_ms = 60000,
                     bool enable_ping_pong = true,
-                    std::function<void()> extra_config = nullptr);
+                    std::function<void()> extra_config = nullptr,
+                    uint32_t stack = 10024,
+                    size_t relief_delay = 1);
 
     /**
      * @brief Set the callback for handling text messages.
@@ -156,8 +158,8 @@ private:
      */
     struct DecodedMessage
     {
-        void *data;   /**< Pointer to the message data */
-        size_t length;/**< Length of the message data */
+        void *data;      /**< Pointer to the message data */
+        uint64_t length; /**< Length of the message data */
     };
 
     /**
@@ -180,6 +182,8 @@ private:
      * @brief Handle client connections.
      */
     void handle_client();
+
+   
 
     /**
      * @brief Send handshake to the client.
@@ -210,7 +214,7 @@ private:
      * @param type The type of WebSocket message.
      * @return Vector containing the encoded WebSocket frame.
      */
-    std::vector<uint8_t> encode_frame(const std::vector<uint8_t>& message, ws_type_t type);
+    std::vector<uint8_t> encode_frame(const std::vector<uint8_t> &message, ws_type_t type);
 
     /**
      * @brief Send a ping message.
@@ -231,24 +235,31 @@ private:
      */
     ws_client_info_t get_client_info(const std::string &request);
 
-    uint16_t port;                    /**< Server port */
-    int server_sock;                  /**< Server socket */
-    int client_sock;                  /**< Client socket */
-    TimerHandle_t ping_timer;         /**< Timer handle for ping messages */
-    uint64_t max_inactivity_ms;       /**< Maximum inactivity period in milliseconds */
-    bool ping_pong_enabled;           /**< Flag to enable ping messages to client */
-    size_t ping_interval_ms;          /**< Interval for sending ping messages in milliseconds */
-    char* user;                       /**< Username */
-    char* pwd;                        /**< Password */
+    uint16_t port;              /**< Server port */
+    int server_sock;            /**< Server socket */
+    int client_sock;            /**< Client socket */
+    TimerHandle_t ping_timer;   /**< Timer handle for ping messages */
+    uint64_t max_inactivity_ms; /**< Maximum inactivity period in milliseconds */
+    bool ping_pong_enabled;     /**< Flag to enable ping messages to client */
+    size_t ping_interval_ms;    /**< Interval for sending ping messages in milliseconds */
+    char *user;                 /**< Username */
+    char *pwd;                  /**< Password */
+    size_t relief_delay;
 
-    std::function<void(int, const std::string &)> text_message_callback;  /**< Callback for text messages */
+    std::function<void(int, const std::string &)> text_message_callback;            /**< Callback for text messages */
     std::function<void(int, const std::vector<uint8_t> &)> binary_message_callback; /**< Callback for binary messages */
-    std::function<void(int)> ping_message_callback; /**< Callback for ping messages */
-    std::function<void(int)> pong_message_callback; /**< Callback for pong messages */
-    std::function<void(int)> close_message_callback; /**< Callback for close messages */
-    std::function<void(int)> client_connected_callback; /**< Callback for client connections */
-    std::function<void(int)> client_disconnected_callback; /**< Callback for client disconnections */
+    std::function<void(int)> ping_message_callback;                                 /**< Callback for ping messages */
+    std::function<void(int)> pong_message_callback;                                 /**< Callback for pong messages */
+    std::function<void(int)> close_message_callback;                                /**< Callback for close messages */
+    std::function<void(int)> client_connected_callback;                             /**< Callback for client connections */
+    std::function<void(int)> client_disconnected_callback;                          /**< Callback for client disconnections */
 
-    static WSLightServer *instance;   /**< Singleton instance */
+    static WSLightServer *instance;            /**< Singleton instance */
     static const constexpr bool debug = false; /**< Debug flag */
+    static DecodedMessage accumulated_message;
+    void handle_ping(int client_sock, DecodedMessage &decoded);
+    void process_message(int client_sock, DecodedMessage &decoded, ws_type_t type);
+    void handle_client_connection();
+    bool setup_server();
+    void cleanup_client_connection();
 };
