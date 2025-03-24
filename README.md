@@ -56,13 +56,6 @@ Here are some example usages of the WSLightServer library:
 #include "ws_light_server.h"
 
 /**
- * /**
- * @author Daniel Giménez
- * @date 2024-08-05
- * @date updated 2025-03-24 - Full revamp
- * @license MIT License
- * @brief Minimal startup example for the WebSocket server.
- *
  * This function initializes and starts the WebSocket server using default parameters.
  * By default:
  * - The server runs in Access Point mode.
@@ -88,12 +81,6 @@ extern "C" void app_main(void) {
 #include "ws_light_server.h"
 
 /**
- * @author Daniel Giménez
- * @date 2024-08-05
- * @date updated 2025-03-24 - Full revamp
- * @license MIT License
- * @brief Entry point of the application.
- *
  * This function initializes and starts the WebSocket server using custom configuration values.
  * The server operates in Access Point mode by default with:
  *  - SSID: "myLittlePony"
