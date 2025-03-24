@@ -1,0 +1,14 @@
+description: WSServer light for idf
+include:
+- /examples
+license: MIT
+maintainers:
+- wikilift
+name: light_websocket_server
+targets:
+- esp32
+- esp32s2
+- esp32c3
+- esp32s3
+url: https://github.com/wikilift/Light-WebSocketServer-IDF
+version: 0.0.2

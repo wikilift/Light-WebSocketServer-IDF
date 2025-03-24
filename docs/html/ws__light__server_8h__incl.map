@@ -1,0 +1,11 @@
+<map id="include/ws_light_server.h" name="include/ws_light_server.h">
+<area shape="rect" id="node1" title="WSLightServer class for managing a single WebSocket connection on ESP32." alt="" coords="369,5,556,32"/>
+<area shape="rect" id="node2" title=" " alt="" coords="5,80,107,107"/>
+<area shape="rect" id="node3" title=" " alt="" coords="131,80,215,107"/>
+<area shape="rect" id="node4" title=" " alt="" coords="239,80,326,107"/>
+<area shape="rect" id="node5" title=" " alt="" coords="351,80,465,107"/>
+<area shape="rect" id="node6" title=" " alt="" coords="489,80,548,107"/>
+<area shape="rect" id="node7" title=" " alt="" coords="573,80,659,107"/>
+<area shape="rect" id="node8" href="$ws__types_8h.html" title="Definitions for WebSocket frame types and client connection types." alt="" coords="683,80,778,107"/>
+<area shape="rect" id="node9" title=" " alt="" coords="803,80,933,107"/>
+</map>
