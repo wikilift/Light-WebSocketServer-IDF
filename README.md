@@ -153,7 +153,7 @@ extern "C" void app_main(void)
 
 ## Documentation 📚
 
-📖 [View online API documentation](docs/index.html)
+📖 [View online API documentation](https://github.com/wikilift/Light-WebSocketServer-IDF/blob/master/docs/html/index.html)
 
 
 
