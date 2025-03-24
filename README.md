@@ -151,6 +151,38 @@ extern "C" void app_main(void)
 
 ```
 
+## WebSocket Test Script (Python)
+
+This repository includes a simple test script in Python to verify that the WebSocket server is functioning correctly.
+
+```
+Path: test_websocket_python/test_websocket_access_point.py
+```
+
+Requirements:
+
+    - Python 3.6+
+
+Libraries
+
+```
+asyncio (standard library)
+
+websockets library
+```
+
+Install dependencies:
+```bash
+pip install websockets
+```
+Run the script:
+```bash
+python3 test_websocket_python/test_websocket_access_point.py
+```
+
+This script will connect to the ESP32 in Access Point mode, receive messages, and print both text and binary frames to the console.
+To connect in STA mode simply replace the script IP with the IP of the device on the local network.
+
 ## Documentation 📚
 
 📖 [View online API documentation](https://github.com/wikilift/Light-WebSocketServer-IDF/blob/master/docs/html/index.html)
