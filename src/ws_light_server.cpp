@@ -41,9 +41,10 @@
 #include <esp_event.h>
 #include <esp_netif.h>
 #include <esp_log.h>
+#include <errno.h>
 #include <sys/socket.h>
 
-static const char *TAG = "WSLightServer";
+static const char *TAG = "WikiliftSocketServer";
 WSLightServer *WSLightServer::instance = nullptr;
 
 WSLightServer &WSLightServer::getInstance()
@@ -54,16 +55,30 @@ WSLightServer &WSLightServer::getInstance()
     }
     return *instance;
 }
-
 WSLightServer::WSLightServer()
     : server_sock(-1),
-      client_sock(-1) 
+      client_sock(-1),
+      isAp(false),
+      ping_pong_enabled(true),
+      ping_interval_ms(30000),
+      max_inactivity_ms(60000),
+      port(80),
+      sockMutex(xSemaphoreCreateMutex()),
+      lastRxMs(0),
+      clientTaskHandle(nullptr),
+      pingTaskHandle(nullptr),
+      running(false),
+      gotIpRegistered(false)
 {
 }
 
 bool WSLightServer::isClientConnected() const
 {
-    return (client_sock > 0);
+    int s;
+    xSemaphoreTake(sockMutex, portMAX_DELAY);
+    s = client_sock;
+    xSemaphoreGive(sockMutex);
+    return (s > 0);
 }
 
 void WSLightServer::onTextMessage(std::function<void(int, const std::string &)> cb) { text_message_cb = cb; }
@@ -77,7 +92,7 @@ void WSLightServer::onClientDisconnected(std::function<void(int)> cb) { client_d
 void WSLightServer::got_ip_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
     ip_event_got_ip_t *event = reinterpret_cast<ip_event_got_ip_t *>(event_data);
-    ESP_LOGI("WiFi", "Conectado con IP: " IPSTR, IP2STR(&event->ip_info.ip));
+    ESP_LOGI("WiFi", "Connected with IP: " IPSTR, IP2STR(&event->ip_info.ip));
 }
 
 esp_err_t WSLightServer::wifi_init(const char *ssid,
@@ -85,21 +100,48 @@ esp_err_t WSLightServer::wifi_init(const char *ssid,
                                    bool isAp,
                                    std::function<void()> extra_config)
 {
-    ESP_ERROR_CHECK(nvs_flash_init());
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-
-    if (isAp)
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND)
     {
-        esp_netif_create_default_wifi_ap();
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ESP_ERROR_CHECK(nvs_flash_init());
     }
     else
     {
-        esp_netif_create_default_wifi_sta();
+        ESP_ERROR_CHECK(err);
+    }
+
+    ESP_ERROR_CHECK(esp_netif_init());
+
+    err = esp_event_loop_create_default();
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE)
+    {
+        ESP_ERROR_CHECK(err);
+    }
+    if (wifi_netif_ != nullptr && netif_is_ap_ != isAp)
+    {
+        esp_netif_destroy(wifi_netif_);
+        wifi_netif_ = nullptr;
+    }
+
+    if (wifi_netif_ == nullptr)
+    {
+        wifi_netif_ = isAp ? esp_netif_create_default_wifi_ap()
+                           : esp_netif_create_default_wifi_sta();
+        if (wifi_netif_ == nullptr)
+        {
+            ESP_LOGE(TAG, "Failed to create default wifi netif");
+            return ESP_FAIL;
+        }
+        netif_is_ap_ = isAp;
     }
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    err = esp_wifi_init(&cfg);
+    if (err != ESP_OK && err != ESP_ERR_WIFI_INIT_STATE)
+    {
+        ESP_ERROR_CHECK(err);
+    }
 
     wifi_config_t wifi_config = {};
     if (isAp)
@@ -127,9 +169,13 @@ esp_err_t WSLightServer::wifi_init(const char *ssid,
         ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
         ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
 
-        ESP_ERROR_CHECK(esp_event_handler_register(
-            IP_EVENT, IP_EVENT_STA_GOT_IP,
-            &got_ip_handler, this));
+        if (!gotIpRegistered)
+        {
+            ESP_ERROR_CHECK(esp_event_handler_register(
+                IP_EVENT, IP_EVENT_STA_GOT_IP,
+                &got_ip_handler, this));
+            gotIpRegistered = true;
+        }
     }
 
     if (extra_config)
@@ -143,6 +189,7 @@ esp_err_t WSLightServer::wifi_init(const char *ssid,
         vTaskDelay(pdMS_TO_TICKS(1000));
         ESP_ERROR_CHECK(esp_wifi_connect());
     }
+
     return ESP_OK;
 }
 
@@ -199,11 +246,8 @@ esp_err_t WSLightServer::send_handshake_response(int sock, const char *request)
         ESP_LOGE(TAG, "Failed to send handshake response");
         return ESP_FAIL;
     }
-    if (debug)
 
-    {
-        ESP_LOGI(TAG, "Handshake successful with client %d", sock);
-    }
+    ESP_LOGI(TAG, "Handshake successful with client %d", sock);
     return ESP_OK;
 }
 
@@ -221,7 +265,6 @@ static int recv_http_request(int sock, char *buffer, size_t buflen)
     }
     return r;
 }
-
 esp_err_t WSLightServer::start(const char *ssid,
                                const char *password,
                                uint16_t port,
@@ -229,25 +272,97 @@ esp_err_t WSLightServer::start(const char *ssid,
                                uint64_t max_inactivity_ms,
                                bool isAp,
                                bool enable_ping_pong,
-                               std::function<void()> extra_config)
+                               std::function<void()> extra_config,
+                               uint32_t stackSize)
 {
+    if (running)
+    {
+        ESP_LOGW(TAG, "start() called while already running");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (sockMutex == nullptr)
+    {
+        ESP_LOGE(TAG, "sockMutex is null");
+        return ESP_FAIL;
+    }
+
     this->port = port;
     this->ping_interval_ms = ping_interval_ms;
-    this->max_inactivity_ms = max_inactivity_ms;
     this->isAp = isAp;
-    this->ping_pong_enabled = enable_ping_pong;
 
-    esp_err_t ret = wifi_init(ssid, password, isAp, extra_config);
+    this->ping_pong_enabled = enable_ping_pong && (ping_interval_ms > 0);
+    this->max_inactivity_ms = (this->ping_pong_enabled) ? max_inactivity_ms : 0;
+
+    xSemaphoreTake(sockMutex, portMAX_DELAY);
+    client_sock = -1;
+    server_sock = -1;
+    lastRxMs = 0;
+    clientTaskHandle = nullptr;
+    pingTaskHandle = nullptr;
+    xSemaphoreGive(sockMutex);
+
+    running = true;
+
+    const esp_err_t ret = wifi_init(ssid, password, isAp, extra_config);
     if (ret != ESP_OK)
     {
+        ESP_LOGE(TAG, "wifi_init failed: %s (%d)", esp_err_to_name(ret), (int)ret);
+        running = false;
         return ret;
     }
 
-    xTaskCreate(&WSLightServer::handle_client_wrapper, "ws_client_task", 4096, this, 5, nullptr);
+    TaskHandle_t ct = nullptr;
+    BaseType_t ok1 = xTaskCreate(&WSLightServer::handle_client_wrapper,
+                                 "ws_client_task",
+                                 stackSize,
+                                 this,
+                                 5,
+                                 &ct);
+
+    if (ok1 != pdPASS)
+    {
+        ESP_LOGE(TAG, "xTaskCreate(ws_client_task) FAILED. stackParam=%u (FreeRTOS words!), freeHeap=%u",
+                 (unsigned)stackSize, (unsigned)esp_get_free_heap_size());
+
+        running = false;
+        if (!isAp)
+        {
+            (void)esp_wifi_disconnect();
+        }
+        (void)esp_wifi_stop();
+        (void)esp_wifi_deinit();
+
+        return ESP_FAIL;
+    }
+
+    xSemaphoreTake(sockMutex, portMAX_DELAY);
+    clientTaskHandle = ct;
+    xSemaphoreGive(sockMutex);
+
     if (ping_pong_enabled)
     {
-        xTaskCreate(&WSLightServer::ping_task_wrapper, "ws_ping_task", 2048, this, 5, nullptr);
+        TaskHandle_t pt = nullptr;
+        BaseType_t ok2 = xTaskCreate(&WSLightServer::ping_task_wrapper,
+                                     "ws_ping_task",
+                                     2048,
+                                     this,
+                                     5,
+                                     &pt);
+
+        if (ok2 != pdPASS)
+        {
+            ESP_LOGE(TAG, "xTaskCreate(ws_ping_task) FAILED. freeHeap=%u",
+                     (unsigned)esp_get_free_heap_size());
+            (void)stop();
+            return ESP_FAIL;
+        }
+
+        xSemaphoreTake(sockMutex, portMAX_DELAY);
+        pingTaskHandle = pt;
+        xSemaphoreGive(sockMutex);
     }
+
     return ESP_OK;
 }
 
@@ -258,23 +373,38 @@ void WSLightServer::ping_task_wrapper(void *arg)
 
 void WSLightServer::ping_task()
 {
-    for (;;)
+    while (running)
     {
-        if (client_sock > 0 && ping_pong_enabled)
+        int s = -1;
+
+        xSemaphoreTake(sockMutex, portMAX_DELAY);
+        s = client_sock;
+        xSemaphoreGive(sockMutex);
+
+        if (s > 0 && ping_pong_enabled)
         {
             uint8_t ping_payload[4];
-            uint32_t rnd = esp_random();
-            memcpy(ping_payload, &rnd, 4);
+            const uint32_t rnd = esp_random();
+            memcpy(ping_payload, &rnd, sizeof(rnd));
 
-            sendFrame(client_sock, ping_payload, 4, HTTPD_WS_TYPE_PING);
-            if (debug)
+            xSemaphoreTake(sockMutex, portMAX_DELAY);
+            const bool canSend = (client_sock == s && running);
+            xSemaphoreGive(sockMutex);
+
+            if (canSend)
             {
-                ESP_LOGI("WSLightServer", " Sending PING to client %d: %02X %02X %02X %02X", client_sock,
-                         ping_payload[0], ping_payload[1], ping_payload[2], ping_payload[3]);
+                sendFrame(s, ping_payload, sizeof(ping_payload), HTTPD_WS_TYPE_PING);
             }
         }
+
         vTaskDelay(pdMS_TO_TICKS(ping_interval_ms));
     }
+
+    xSemaphoreTake(sockMutex, portMAX_DELAY);
+    pingTaskHandle = nullptr;
+    xSemaphoreGive(sockMutex);
+
+    vTaskDelete(nullptr);
 }
 
 void WSLightServer::handle_client_wrapper(void *arg)
@@ -284,122 +414,167 @@ void WSLightServer::handle_client_wrapper(void *arg)
 
 void WSLightServer::handle_client()
 {
-    server_sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_sock < 0)
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0)
     {
-        ESP_LOGE(TAG, "Error creating socket");
+        xSemaphoreTake(sockMutex, portMAX_DELAY);
+        clientTaskHandle = nullptr;
+        xSemaphoreGive(sockMutex);
         vTaskDelete(nullptr);
         return;
     }
 
+    xSemaphoreTake(sockMutex, portMAX_DELAY);
+    server_sock = s;
+    xSemaphoreGive(sockMutex);
+
     int opt = 1;
-    setsockopt(server_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
     sockaddr_in addr = {};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
     addr.sin_addr.s_addr = INADDR_ANY;
 
-    if (bind(server_sock, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0)
+    if (bind(s, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0)
     {
-        ESP_LOGE(TAG, "Socket bind failed");
-        close(server_sock);
+        shutdown(s, SHUT_RDWR);
+        close(s);
+
+        xSemaphoreTake(sockMutex, portMAX_DELAY);
+        server_sock = -1;
+        clientTaskHandle = nullptr;
+        xSemaphoreGive(sockMutex);
+
         vTaskDelete(nullptr);
         return;
     }
 
-    if (listen(server_sock, 1) != 0)
+    if (listen(s, 1) != 0)
     {
-        ESP_LOGE(TAG, "Socket listen failed");
-        close(server_sock);
+        shutdown(s, SHUT_RDWR);
+        close(s);
+
+        xSemaphoreTake(sockMutex, portMAX_DELAY);
+        server_sock = -1;
+        clientTaskHandle = nullptr;
+        xSemaphoreGive(sockMutex);
+
         vTaskDelete(nullptr);
         return;
     }
 
-    ESP_LOGI(TAG, "Server listening on port %d", port);
-
-    for (;;)
+    while (running)
     {
-
         sockaddr_in caddr;
         socklen_t caddr_len = sizeof(caddr);
 
-        client_sock = accept(server_sock, reinterpret_cast<sockaddr *>(&caddr), &caddr_len);
-        if (client_sock < 0)
+        int accepted = accept(s, reinterpret_cast<sockaddr *>(&caddr), &caddr_len);
+        if (accepted < 0)
         {
-            ESP_LOGE(TAG, "Accept error");
+            if (!running)
+            {
+                break;
+            }
             continue;
         }
+
+        xSemaphoreTake(sockMutex, portMAX_DELAY);
+        client_sock = accepted;
+        lastRxMs = esp_timer_get_time() / 1000;
+        xSemaphoreGive(sockMutex);
 
         if (client_connected_cb)
         {
-            client_connected_cb(client_sock);
+            client_connected_cb(accepted);
         }
-        ESP_LOGI(TAG, "Client %d connected", client_sock);
 
         char req[512];
-        int r = recv_http_request(client_sock, req, sizeof(req));
-        if (debug)
+        int r = recv_http_request(accepted, req, sizeof(req));
+
+        if (r <= 0 || !is_websocket_request(req) || send_handshake_response(accepted, req) != ESP_OK)
         {
-            ESP_LOGI(TAG, "Received HTTP request:\n%s", req);
+            shutdown(accepted, SHUT_RDWR);
+            close(accepted);
+
+            xSemaphoreTake(sockMutex, portMAX_DELAY);
+            if (client_sock == accepted)
+                client_sock = -1;
+            xSemaphoreGive(sockMutex);
+
+            continue;
         }
 
-        if (r <= 0)
-        {
-            if (debug)
-            {
-                ESP_LOGE(TAG, "Request length is invalid, len of request: %d", r);
-            }
-            close(client_sock);
-            client_sock = -1;
-            continue;
-        }
-        if (!is_websocket_request(req))
-        {
-            if (debug)
-            {
-                ESP_LOGE(TAG, "Wrong websocket request: %d", r);
-            }
-            close(client_sock);
-            client_sock = -1;
-            continue;
-        }
-        if (send_handshake_response(client_sock, req) != ESP_OK)
-        {
-            ESP_LOGE(TAG, "Handshake NO completed with client %d", client_sock);
-            close(client_sock);
-            client_sock = -1;
-            continue;
-        }
-        if (debug)
-        {
-            ESP_LOGW(TAG, "Handshake completed with client %d", client_sock);
-        }
+        struct timeval tv;
+        tv.tv_sec = 0;
+        tv.tv_usec = 250 * 1000;
+        setsockopt(accepted, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-        for (;;)
+        while (running)
         {
-            int frame_len = readFrame(client_sock, rxBuffer, WS_MAX_FRAME_SIZE);
-            if (debug)
-            {
-                ESP_LOGE("Debug", "Frame readed with len %d", frame_len);
-            }
+            int frame_len = readFrame(accepted, rxBuffer, WS_MAX_FRAME_SIZE);
 
             if (frame_len == -2)
             {
-
+                xSemaphoreTake(sockMutex, portMAX_DELAY);
+                if (client_sock == accepted)
+                    lastRxMs = esp_timer_get_time() / 1000;
+                xSemaphoreGive(sockMutex);
                 continue;
             }
-            else if (frame_len <= 0)
-            {
 
-                close(client_sock);
+            if (frame_len <= 0)
+            {
+                if (frame_len < 0 && (errno == EWOULDBLOCK || errno == EAGAIN))
+                {
+                    int64_t last = 0;
+                    xSemaphoreTake(sockMutex, portMAX_DELAY);
+                    if (client_sock == accepted)
+                        last = lastRxMs;
+                    xSemaphoreGive(sockMutex);
+
+                    const int64_t now = esp_timer_get_time() / 1000;
+                    if (max_inactivity_ms > 0 && last > 0 && (uint64_t)(now - last) > max_inactivity_ms)
+                    {
+                        if (client_disconnected_cb)
+                        {
+                            client_disconnected_cb(accepted);
+                        }
+
+                        shutdown(accepted, SHUT_RDWR);
+                        close(accepted);
+
+                        xSemaphoreTake(sockMutex, portMAX_DELAY);
+                        if (client_sock == accepted)
+                            client_sock = -1;
+                        xSemaphoreGive(sockMutex);
+
+                        break;
+                    }
+
+                    continue;
+                }
+
+                shutdown(accepted, SHUT_RDWR);
+                close(accepted);
+
                 if (client_disconnected_cb)
                 {
-                    client_disconnected_cb(client_sock);
+                    client_disconnected_cb(accepted);
                 }
-                client_sock = -1;
+
+                xSemaphoreTake(sockMutex, portMAX_DELAY);
+                if (client_sock == accepted)
+                    client_sock = -1;
+                xSemaphoreGive(sockMutex);
+
                 break;
             }
+
+            xSemaphoreTake(sockMutex, portMAX_DELAY);
+            if (client_sock == accepted)
+                lastRxMs = esp_timer_get_time() / 1000;
+            xSemaphoreGive(sockMutex);
 
             ws_type_t opcode;
             uint8_t *payload;
@@ -407,7 +582,6 @@ void WSLightServer::handle_client()
 
             if (!decodeFrameInPlace(rxBuffer, frame_len, opcode, payload, payloadLen))
             {
-
                 continue;
             }
 
@@ -416,76 +590,92 @@ void WSLightServer::handle_client()
             case HTTPD_WS_TYPE_TEXT:
                 if (text_message_cb)
                 {
-                    text_message_cb(client_sock, std::string(reinterpret_cast<char *>(payload), payloadLen));
-                }
-                else
-                {
-                    ESP_LOGI("WSLightServer", "Text received: %s", (std::string(reinterpret_cast<char *>(payload)).c_str()));
+                    text_message_cb(accepted, std::string(reinterpret_cast<char *>(payload), payloadLen));
                 }
                 break;
 
             case HTTPD_WS_TYPE_BINARY:
                 if (binary_message_cb)
                 {
-                    binary_message_cb(client_sock, payload, payloadLen);
-                }
-                else
-                {
-                    ESP_LOGI("WSLightServer", "Binary received (%d of bytes)", payloadLen);
+                    binary_message_cb(accepted, payload, payloadLen);
                 }
                 break;
 
             case HTTPD_WS_TYPE_PING:
                 if (ping_cb)
                 {
-                    ping_cb(client_sock);
+                    ping_cb(accepted);
                 }
-                if (client_sock > 0)
+                xSemaphoreTake(sockMutex, portMAX_DELAY);
+                if (client_sock == accepted && accepted > 0 && running)
                 {
-                    if (debug)
-                    {
-                        ESP_LOGI("WSLightServer", "PING received from %d, sending PONG", client_sock);
-                    }
-                    sendFrame(client_sock, payload, payloadLen, HTTPD_WS_TYPE_PONG);
+                    sendFrame(accepted, payload, payloadLen, HTTPD_WS_TYPE_PONG);
                 }
+                xSemaphoreGive(sockMutex);
                 break;
 
             case HTTPD_WS_TYPE_PONG:
                 if (pong_cb)
                 {
-                    pong_cb(client_sock);
-                }
-                if (debug)
-                {
-                    ESP_LOGI("WSLightServer", " PONG received from %d", client_sock);
+                    pong_cb(accepted);
                 }
                 break;
 
             case HTTPD_WS_TYPE_CLOSE:
                 if (close_cb)
                 {
-                    close_cb(client_sock);
+                    close_cb(accepted);
                 }
-                sendFrame(client_sock, nullptr, 0, HTTPD_WS_TYPE_CLOSE);
-                close(client_sock);
-                client_sock = -1;
+
+                xSemaphoreTake(sockMutex, portMAX_DELAY);
+                if (client_sock == accepted && accepted > 0 && running)
+                {
+                    sendFrame(accepted, nullptr, 0, HTTPD_WS_TYPE_CLOSE);
+                }
+                xSemaphoreGive(sockMutex);
+
+                shutdown(accepted, SHUT_RDWR);
+                close(accepted);
+
+                xSemaphoreTake(sockMutex, portMAX_DELAY);
+                if (client_sock == accepted)
+                    client_sock = -1;
+                xSemaphoreGive(sockMutex);
+
                 break;
 
             default:
-                if (debug)
-                {
-                    ESP_LOGI("WSLightServer", " Unknown received from client: %d", client_sock);
-                }
                 break;
             }
 
-            if (client_sock < 0)
-            {
+            int current = -1;
+            xSemaphoreTake(sockMutex, portMAX_DELAY);
+            current = client_sock;
+            xSemaphoreGive(sockMutex);
 
+            if (current < 0)
+            {
                 break;
             }
         }
     }
+
+    int ss2;
+    xSemaphoreTake(sockMutex, portMAX_DELAY);
+    ss2 = server_sock;
+    server_sock = -1;
+    xSemaphoreGive(sockMutex);
+
+    if (ss2 >= 0)
+    {
+        shutdown(ss2, SHUT_RDWR);
+        close(ss2);
+    }
+
+    xSemaphoreTake(sockMutex, portMAX_DELAY);
+    clientTaskHandle = nullptr;
+    xSemaphoreGive(sockMutex);
+    vTaskDelete(nullptr);
 }
 
 int WSLightServer::readFrame(int sock, uint8_t *buf, size_t bufsize)
@@ -501,7 +691,9 @@ int WSLightServer::readFrame(int sock, uint8_t *buf, size_t bufsize)
         offset += r;
     }
 
-    uint8_t opcode = buf[0] & 0x0F;
+    const uint8_t opcode = buf[0] & 0x0F;
+    const bool masked = (buf[1] & 0x80) != 0;
+
     size_t payloadLen = buf[1] & 0x7F;
     int headerLen = 2;
 
@@ -514,7 +706,10 @@ int WSLightServer::readFrame(int sock, uint8_t *buf, size_t bufsize)
         headerLen += 8;
     }
 
-    headerLen += 4;
+    if (masked)
+    {
+        headerLen += 4;
+    }
 
     int totalNeeded = headerLen;
     while (offset < totalNeeded)
@@ -527,16 +722,16 @@ int WSLightServer::readFrame(int sock, uint8_t *buf, size_t bufsize)
 
     if ((buf[1] & 0x7F) == 126)
     {
-        payloadLen = (buf[2] << 8) | buf[3];
+        payloadLen = (static_cast<size_t>(buf[2]) << 8) | static_cast<size_t>(buf[3]);
     }
     else if ((buf[1] & 0x7F) == 127)
     {
         uint64_t bigLen = 0;
         for (int i = 0; i < 8; i++)
         {
-            bigLen = (bigLen << 8) | buf[2 + i];
+            bigLen = (bigLen << 8) | static_cast<uint64_t>(buf[2 + i]);
         }
-        if (bigLen > SIZE_MAX)
+        if (bigLen > static_cast<uint64_t>(SIZE_MAX))
         {
             ESP_LOGE(TAG, "Payload too large for size_t");
             return -1;
@@ -544,9 +739,9 @@ int WSLightServer::readFrame(int sock, uint8_t *buf, size_t bufsize)
         payloadLen = static_cast<size_t>(bigLen);
     }
 
-    totalNeeded = headerLen + payloadLen;
+    totalNeeded = headerLen + static_cast<int>(payloadLen);
 
-    if (totalNeeded > bufsize)
+    if (static_cast<size_t>(totalNeeded) > bufsize)
     {
         if (debug)
         {
@@ -574,16 +769,16 @@ int WSLightServer::readFrame(int sock, uint8_t *buf, size_t bufsize)
                 return r;
             }
 
-            bytesReceived += r;
+            bytesReceived += static_cast<size_t>(r);
         }
 
         if (opcode == HTTPD_WS_TYPE_BINARY && binary_message_cb)
         {
-            binary_message_cb(client_sock, bigBuffer, payloadLen);
+            binary_message_cb(sock, bigBuffer, payloadLen);
         }
         else if (opcode == HTTPD_WS_TYPE_TEXT && text_message_cb)
         {
-            text_message_cb(client_sock, std::string(reinterpret_cast<char *>(bigBuffer), payloadLen));
+            text_message_cb(sock, std::string(reinterpret_cast<char *>(bigBuffer), payloadLen));
         }
 
         vPortFree(bigBuffer);
@@ -720,38 +915,50 @@ void WSLightServer::sendFrame(int sock,
 
 esp_err_t WSLightServer::sendTextMessage(const char *text, size_t length)
 {
-    if (client_sock < 0)
+    int s;
+    xSemaphoreTake(sockMutex, portMAX_DELAY);
+    s = client_sock;
+    xSemaphoreGive(sockMutex);
+
+    if (s < 0)
     {
         return ESP_FAIL;
     }
 
-    sendFrame(client_sock, (const uint8_t *)text, length, HTTPD_WS_TYPE_TEXT);
+    sendFrame(s, reinterpret_cast<const uint8_t *>(text), length, HTTPD_WS_TYPE_TEXT);
     return ESP_OK;
 }
 
 esp_err_t WSLightServer::sendTextMessage(const char *text)
 {
-    if (client_sock < 0)
-    {
-        return ESP_FAIL;
-    }
-
-    sendFrame(client_sock, (const uint8_t *)text, strlen(text), HTTPD_WS_TYPE_TEXT);
-    return ESP_OK;
+    return sendTextMessage(text, strlen(text));
 }
 
 esp_err_t WSLightServer::sendBinaryMessage(const uint8_t *data, size_t length)
 {
-    if (client_sock < 0)
+    int s;
+    xSemaphoreTake(sockMutex, portMAX_DELAY);
+    s = client_sock;
+    xSemaphoreGive(sockMutex);
+
+    if (s < 0)
     {
         return ESP_FAIL;
     }
-    sendFrame(client_sock, data, length, HTTPD_WS_TYPE_BINARY);
+
+    sendFrame(s, data, length, HTTPD_WS_TYPE_BINARY);
     return ESP_OK;
 }
+
 esp_err_t WSLightServer::sendVideoFrame(const uint8_t *data, size_t length)
 {
-    if (client_sock < 0)
+    int s;
+    xSemaphoreTake(sockMutex, portMAX_DELAY);
+    s = client_sock;
+    const bool isRunning = running;
+    xSemaphoreGive(sockMutex);
+
+    if (!isRunning || s < 0)
     {
         return ESP_FAIL;
     }
@@ -761,20 +968,102 @@ esp_err_t WSLightServer::sendVideoFrame(const uint8_t *data, size_t length)
 
     while (bytesSent < length)
     {
+        xSemaphoreTake(sockMutex, portMAX_DELAY);
+        const bool stillRunning = running && (client_sock == s);
+        xSemaphoreGive(sockMutex);
 
-        size_t chunkSize = ((length - bytesSent) > WS_MAX_FRAME_SIZE)
-                               ? WS_MAX_FRAME_SIZE
-                               : (length - bytesSent);
+        if (!stillRunning)
+        {
+            return ESP_FAIL;
+        }
 
-        ws_type_t opCode = firstFragment ? HTTPD_WS_TYPE_BINARY : HTTPD_WS_TYPE_CONTINUATION;
+        const size_t chunkSize = ((length - bytesSent) > WS_MAX_FRAME_SIZE)
+                                     ? WS_MAX_FRAME_SIZE
+                                     : (length - bytesSent);
 
-        bool isLastFragment = ((bytesSent + chunkSize) == length);
+        const ws_type_t opCode = firstFragment ? HTTPD_WS_TYPE_BINARY : HTTPD_WS_TYPE_CONTINUATION;
+        const bool isLastFragment = ((bytesSent + chunkSize) == length);
 
-        sendFrame(client_sock, data + bytesSent, chunkSize, opCode, isLastFragment);
+        sendFrame(s, data + bytesSent, chunkSize, opCode, isLastFragment);
 
         bytesSent += chunkSize;
         firstFragment = false;
     }
 
     return ESP_OK;
+}
+
+esp_err_t WSLightServer::stop()
+{
+    if (!running)
+    {
+        return ESP_OK;
+    }
+
+    running = false;
+
+    closeClientSockSafe();
+
+    int ss;
+    xSemaphoreTake(sockMutex, portMAX_DELAY);
+    ss = server_sock;
+    server_sock = -1;
+    xSemaphoreGive(sockMutex);
+
+    if (ss >= 0)
+    {
+        shutdown(ss, SHUT_RDWR);
+        close(ss);
+    }
+
+    const int64_t t0 = esp_timer_get_time() / 1000;
+    for (;;)
+    {
+        TaskHandle_t ct;
+        TaskHandle_t pt;
+
+        xSemaphoreTake(sockMutex, portMAX_DELAY);
+        ct = clientTaskHandle;
+        pt = pingTaskHandle;
+        xSemaphoreGive(sockMutex);
+
+        if (ct == nullptr && pt == nullptr)
+        {
+            break;
+        }
+
+        const int64_t now = esp_timer_get_time() / 1000;
+        if ((now - t0) > 2000)
+        {
+            break;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+
+    if (!isAp)
+    {
+        (void)esp_wifi_disconnect();
+    }
+
+    (void)esp_wifi_stop();
+    (void)esp_wifi_deinit();
+
+    if (gotIpRegistered)
+    {
+        (void)esp_event_handler_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, &got_ip_handler);
+        gotIpRegistered = false;
+    }
+
+    if (wifi_netif_ != nullptr)
+    {
+        esp_netif_destroy(wifi_netif_);
+        wifi_netif_ = nullptr;
+    }
+
+    xSemaphoreTake(sockMutex, portMAX_DELAY);
+    const bool tasksStopped = (clientTaskHandle == nullptr && pingTaskHandle == nullptr);
+    xSemaphoreGive(sockMutex);
+
+    return tasksStopped ? ESP_OK : ESP_FAIL;
 }
